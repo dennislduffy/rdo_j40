@@ -1,5 +1,6 @@
 library(sf)
 library(tidyverse)
+library(RSQLite)
 
 sf::sf_use_s2(FALSE)
 
@@ -40,7 +41,8 @@ mn <- st_read("j40_spatial/j40_spatial.gdb", layer = "usa",
       IS_PFS as total_percentiles,  
       HRS_ET as redlining, 
       SN_C as dac,
-      FPL200S as low_income
+      FPL200S as low_income, 
+      TA_PERC as tribal_percent
     from usa
     where SF = 'Minnesota'
                  ") |> 
@@ -51,7 +53,8 @@ mn <- st_read("j40_spatial/j40_spatial.gdb", layer = "usa",
   total_percentiles = total_percentiles + redlining, 
   rank = cume_dist(total_percentiles), 
   county_name = str_replace(county_name, " County", ""), 
-  dac = ifelse(dac == 1, "Disadvantaged", "Not Disadvantaged")) |> 
+  dac = ifelse(dac == 1, "Disadvantaged", "Not Disadvantaged"), 
+  low_income = ifelse(low_income == 1, "Low Income", "Not Low Income")) |> 
   select(-c(redlining))
 
 #boundary database retrieved from https://gisdata.mn.gov/dataset/bdry-mn-city-township-unorg
@@ -66,6 +69,11 @@ boundaries <- st_read("town_boundaries/bdry_mn_city_township_unorg.gdb", layer =
   mutate(county = case_when(
     county == "Saint Louis" ~ "St. Louis",
     TRUE ~ county
+  ), 
+  city = case_when(
+    city == "Saint Cloud" ~ "St. Cloud", 
+    city == "Saint Louis Park" ~ "St. Louis Park",
+    TRUE ~ city
   )) |> 
   st_transform("EPSG:4326") |>
   st_cast("MULTIPOLYGON")
@@ -80,8 +88,47 @@ boundary_tracts <- boundaries |>
          )) |> 
   filter(drop_flag == FALSE) |> 
   tibble() |> 
-  select(city, GEOID10)
+  select(city, county, GEOID10)
 
+
+# pull in city population levels
+
+db <- dbConnect(RSQLite::SQLite(), "Databases/rdo_files.db")
+
+pop_query <- dbSendQuery(db, 
+                         "
+                         select NAME as city, POPESTIMATE2023 as population, 
+                          case when COUNTY_NAME = 'Saint Louis' then 'St. Louis'
+                          else COUNTY_NAME end as county
+                         FROM town_populations
+                         "
+                         )
+
+city_populations <- dbFetch(pop_query) |> 
+  tibble() 
+
+boundary_tracts <- boundary_tracts |> 
+  left_join(city_populations, by = c("city" = "city", "county" = "county"))
+
+# pull in RDO territories
+
+rdo_query <- dbSendQuery(db, 
+                         "
+                         select county, rdo
+                         from rdo_counties
+                         "
+                         )
+
+rdo_counties <- fetch(rdo_query) |> 
+  tibble() |> 
+  mutate(county = str_replace(county, " County", ""))
+
+rdo_burdens <- mn |> 
+  left_join(boundary_tracts, by = "GEOID10") |> 
+  left_join(rdo_counties, by = c("county_name" = "county"))
+
+
+st_write(rdo_burdens, "Datasets/shape/rdo_burdens.shp", delete_dsn = TRUE)
 
 
 
